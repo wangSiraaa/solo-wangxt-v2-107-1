@@ -1,0 +1,87 @@
+{
+  "id": "acme",
+  "realm": "acme",
+  "enabled": true,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "verifyEmail": false,
+  "resetPasswordAllowed": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 3600,
+  "roles": {
+    "realm": [
+      { "name": "default" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "acme-rp",
+      "name": "OIDC Tenant RP - Acme",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "acme-rp-secret",
+      "redirectUris": [
+        "http://localhost:8080/oauth/callback",
+        "http://localhost:8080/oauth/link/callback"
+      ],
+      "webOrigins": [],
+      "defaultClientScopes": [
+        "web-origins",
+        "profile",
+        "roles",
+        "email"
+      ],
+      "attributes": {
+        "saml.assertion.signature": "false",
+        "saml.force.post.binding": "false"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "email": "alice@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Alice",
+      "lastName": "Acme",
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "alice-pass", "temporary": false }
+      ],
+      "realmRoles": ["default"]
+    },
+    {
+      "username": "carol",
+      "email": "carol@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Carol",
+      "lastName": "Acme",
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "carol-pass", "temporary": false }
+      ],
+      "realmRoles": ["default"]
+    }
+  ],
+  "components": {
+    "org.keycloak.keys.KeyProvider": [
+      {
+        "name": "rsa-generated",
+        "providerId": "rsa-generated",
+        "config": {
+          "priority": ["100"],
+          "keySize": ["2048"]
+        }
+      }
+    ]
+  }
+}

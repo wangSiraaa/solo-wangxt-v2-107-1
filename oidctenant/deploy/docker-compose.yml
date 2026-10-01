@@ -1,0 +1,31 @@
+# 本地开发环境：PostgreSQL + Keycloak（含 acme/globex 两个 realm 自动导入）。
+# 不包含应用与前端；应用用 `go run ./cmd/server` 启动。
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: oidc
+      POSTGRES_PASSWORD: oidc
+      POSTGRES_DB: oidctenant
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oidc -d oidctenant"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.5
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=8180
+      - --hostname-strict=false
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8180:8180"
+    volumes:
+      - ./keycloak/import:/opt/keycloak/data/import

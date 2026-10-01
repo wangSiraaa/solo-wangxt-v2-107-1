@@ -1,0 +1,66 @@
+{
+  "tenants": [
+    {
+      "id": "00000000-0000-0000-0000-0000000000a1",
+      "slug": "acme",
+      "name": "Acme Corp",
+      "providers": [
+        {
+          "id": "00000000-0000-0000-0000-0000000000a2",
+          "issuer": "http://localhost:8180/realms/acme",
+          "client_id": "acme-rp",
+          "client_secret": "acme-rp-secret",
+          "redirect_uris": [
+            "http://localhost:8080/oauth/callback",
+            "http://localhost:8080/oauth/link/callback"
+          ],
+          "auth_time_max_age": 300,
+          "enabled": true
+        },
+        {
+          "id": "00000000-0000-0000-0000-0000000000a3",
+          "issuer": "http://localhost:8180/realms/globex",
+          "client_id": "globex-rp",
+          "client_secret": "globex-rp-secret",
+          "redirect_uris": [
+            "http://localhost:8080/oauth/callback",
+            "http://localhost:8080/oauth/link/callback"
+          ],
+          "auth_time_max_age": 300,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "00000000-0000-0000-0000-0000000000b1",
+      "slug": "globex",
+      "name": "Globex Inc",
+      "providers": [
+        {
+          "id": "00000000-0000-0000-0000-0000000000b2",
+          "issuer": "http://localhost:8180/realms/globex",
+          "client_id": "globex-rp",
+          "client_secret": "globex-rp-secret",
+          "redirect_uris": [
+            "http://localhost:8080/oauth/callback",
+            "http://localhost:8080/oauth/link/callback"
+          ],
+          "auth_time_max_age": 300,
+          "enabled": true
+        },
+        {
+          "id": "00000000-0000-0000-0000-0000000000b3",
+          "issuer": "http://localhost:8180/realms/acme",
+          "client_id": "acme-rp",
+          "client_secret": "acme-rp-secret",
+          "redirect_uris": [
+            "http://localhost:8080/oauth/callback",
+            "http://localhost:8080/oauth/link/callback"
+          ],
+          "auth_time_max_age": 300,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

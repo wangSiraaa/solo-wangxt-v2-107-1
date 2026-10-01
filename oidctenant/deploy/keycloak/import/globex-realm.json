@@ -1,0 +1,112 @@
+{
+  "id": "globex",
+  "realm": "globex",
+  "enabled": true,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "verifyEmail": false,
+  "resetPasswordAllowed": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 3600,
+  "roles": {
+    "realm": [
+      { "name": "default" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "globex-rp",
+      "name": "OIDC Tenant RP - Globex",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "globex-rp-secret",
+      "redirectUris": [
+        "http://localhost:8080/oauth/callback",
+        "http://localhost:8080/oauth/link/callback"
+      ],
+      "webOrigins": [],
+      "defaultClientScopes": [
+        "web-origins",
+        "profile",
+        "roles",
+        "email"
+      ]
+    },
+    {
+      "clientId": "globex-audience-probe",
+      "name": "Different audience client (audience verification probe)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "secret": "probe-secret",
+      "redirectUris": [
+        "http://localhost:8080/oauth/callback"
+      ],
+      "webOrigins": [],
+      "defaultClientScopes": [
+        "web-origins",
+        "profile",
+        "roles",
+        "email"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice.globex",
+      "email": "alice@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Alice",
+      "lastName": "Globex",
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "aliceg-pass", "temporary": false }
+      ],
+      "realmRoles": ["default"]
+    },
+    {
+      "username": "bob",
+      "email": "bob@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Bob",
+      "lastName": "Globex",
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "bobg-pass", "temporary": false }
+      ],
+      "realmRoles": ["default"]
+    }
+  ],
+  "components": {
+    "org.keycloak.keys.KeyProvider": [
+      {
+        "name": "rsa-initial",
+        "providerId": "rsa-generated",
+        "config": {
+          "priority": ["100"],
+          "keySize": ["2048"]
+        }
+      },
+      {
+        "name": "rsa-rotated",
+        "providerId": "rsa-generated",
+        "config": {
+          "priority": ["10"],
+          "keySize": ["2048"]
+        }
+      }
+    ]
+  }
+}
