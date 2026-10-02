@@ -36,7 +36,7 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `members` | 租户内的成员（业务账号） |
 | `identities` | 已核实身份；**`UNIQUE(tenant_id, issuer, subject)` 是身份锚点**；`email` 无唯一约束 |
 | `auth_requests` | 进行中的授权请求：`state` 主键 + `nonce` + `pkce_verifier`，一次性消费（`consumed_at`） |
-| `sessions` | 不透明会话令牌（数据库存 SHA-256 哈希） |
+| `sessions` | 不透明会话令牌（数据库存 SHA-256 哈希），含设备展示标签 `device_label`、`last_seen_at`/`last_ip` 最近活动、`revoked_at`/`revoked_reason` 活跃/已撤销状态 |
 | `link_sessions` | 账号关联会话：A/B 两条 leg 的 issuer/subject/auth_time，一次性 token |
 
 > 关联外部身份时，身份行的 `tenant_id` 是**发起关联的租户**。
@@ -58,6 +58,8 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `binding_conflict` | 409 | 目标身份已绑给别的成员、自关联、关联会话重放 |
 | `invalid_request` | 400 | state 缺失/已用/伪造、回调地址不在白名单、参数非法 |
 | `reauthentication_required` | 401 | 关联时某一身份未在 `auth_time_max_age` 窗口内重新认证 |
+| `not_found` | 404 | 撤销的设备会话不属于当前成员/租户（与“不存在”不可区分，防枚举） |
+| `temporarily_unavailable` | 503 | 撤销与受保护请求竞争行锁超时，可安全重试 |
 
 端点：
 
@@ -67,10 +69,38 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `GET  /t/{slug}/login?issuer=...&return_to=/...` | 发起登录，302 到 IdP |
 | `GET  /oauth/callback` | 登录回调（固定路径） |
 | `GET  /t/{slug}/api/me` | 当前成员与其已绑定身份（需会话 Cookie `sid`） |
-| `POST /t/{slug}/api/logout` | 吊销会话 |
+| `POST /t/{slug}/api/logout` | **只**吊销当前这台设备的会话（单设备退出语义保持不变） |
+| `GET  /t/{slug}/api/sessions` | 列出当前成员在当前租户的设备会话（标签/创建/最近活动/活跃·已撤销/是否当前） |
+| `POST /t/{slug}/api/sessions/{id}/revoke` | 撤销指定的某台设备（其他设备或当前设备）；重复撤销幂等 |
+| `POST /t/{slug}/api/sessions/revoke-all` | 全部设备退出；body `{"include_current": false}` 表示只下线其他设备 |
 | `POST /t/{slug}/api/links` | 发起账号关联，返回 `link_token` 与 `link_url`；body `{"issuer":"..."}` |
 | `GET  /oauth/link/callback` | 关联第二身份的回调（强制重认证） |
 | `GET  /t/{slug}/api/links/{token}` | 查询关联会话状态（一次性） |
+
+## 设备会话管理（丢失设备只下线那一台）
+
+在不透明 `sid` 之上为每条会话保存**不含令牌内容**的展示信息：
+
+- `device_label`：登录时从 `User-Agent` 派生（剥离 CR/LF 等控制字符、截断 200 字符）；
+- `created_at` / `last_seen_at` / `last_ip`：创建与最近活动；
+- 状态：`active`（`revoked_at IS NULL` 且未过期）或 `revoked`。
+
+**只暴露随机会话 UUID（v4），与 `sid` 不可互相推导；任何响应、列表、日志都不返回
+原始 `sid`、`token_hash`、授权码或身份令牌。**
+
+并发与撤销竞争的正确性来自数据库行锁（PostgreSQL `SELECT ... FOR UPDATE`）：
+
+- 受保护请求在中间件里开启事务、`FOR UPDATE` 锁住本会话行，**锁持有整个请求期间**，
+  并在同事务校验未撤销/未过期、刷新 `last_seen_at`；
+- 撤销（单台/全部）对目标行 `FOR UPDATE` 后才写 `revoked_at`。
+  因此撤销与该会话上的受保护操作被**线性化**：撤销先拿锁则请求拿锁即见 `revoked_at`
+  → 401，绝不放行写入；请求先拿锁则撤销阻塞到请求结束，不存在“撤销后仍写入成功”；
+- 全部退出按会话 `id` 排序加锁，避免并发批量撤销之间的 AB-BA 死锁；
+  `lock_timeout` + 死锁检测在上层统一映射为 503（可安全重试）；
+- 当前会话撤销自身（`logout`、撤销当前设备、含当前的全部退出）复用请求自己的租约事务，
+  “响应完成”与“会话已撤销”是同一个提交点，并清理 `sid` Cookie；
+- 其他成员 / 其他租户 / 未知的会话 id 返回完全一致的 `404 not_found`，无法枚举；
+  跨租户携带他租户 `sid` 仍为 403（既有隔离语义不变）。
 
 ## 安全实现细节
 
@@ -172,6 +202,8 @@ KC_BASE_URL=http://localhost:8180 go test ./integration/... -v
 | `TestRedirectURIMustBeWhitelisted` | 未登记回调地址 → 400 `invalid_request` |
 | `TestLinkRejectsDisabledProvider` | 关联前禁用 provider 授权 → 403 `tenant_unauthorized` |
 | `TestWrongPasswordIsAuthnFailure` | IdP 凭证错误不产生会话/成员 |
+| `TestDeviceSessions_*`（embedded PG，无 Keycloak） | 设备会话：双设备区分/仅撤销其一、被撤销设备 401 而另一台可用、重复撤销幂等、撤销与受保护操作并发线性互斥（真实行锁，30 轮 fail-closed）、全部退出/下线其他设备、跨租户同邮箱与另一成员不可枚举或撤销、单设备 logout 语义不变、写入型接口同样 fail-closed、响应与日志不含原始 sid |
+| `TestDeviceSessions_EndToEnd*`（需 Keycloak） | 真实 OIDC 登录两台/三台设备后列出、撤销其他设备、全部退出的端到端流程 |
 
 ## 生产化前还应补充（本项目刻意省略）
 

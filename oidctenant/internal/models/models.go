@@ -69,7 +69,16 @@ type Session struct {
 	TenantID  uuid.UUID
 	MemberID  uuid.UUID
 	TokenHash []byte
+	// DeviceLabel 是不含任何令牌内容的展示标签（如截断后的 User-Agent）。
+	DeviceLabel string
+	CreatedAt   time.Time
+	LastSeenAt  time.Time
+	// LastIP 仅用于展示最近活动地址。
+	LastIP    string
 	ExpiresAt time.Time
+	// RevokedAt.Valid 表示已撤销（活跃 = 未撤销且未过期）。
+	RevokedAt     NullTime
+	RevokedReason NullString
 }
 
 type LinkSession struct {

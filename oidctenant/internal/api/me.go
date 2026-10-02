@@ -1,10 +1,7 @@
 package api
 
 import (
-	"errors"
 	"net/http"
-
-	"github.com/example/oidctenant/internal/store"
 )
 
 // identityView 暴露给业务接口的身份信息。
@@ -41,21 +38,17 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /t/{slug}/api/logout
+//
+// 保持原有单设备退出语义：只撤销当前请求携带的这一个会话并清除 Cookie。
+// 其他设备的会话不受影响（要下线其余设备请用 /api/sessions/...）。
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	ac := authed(r)
-	if err := s.store.RevokeSession(r.Context(), ac.session.ID); err != nil &&
-		!errors.Is(err, store.ErrNotFound) {
+	// 在当前租约事务内撤销自身：与本请求原子提交，不会自锁。
+	if err := ac.lease.RevokeSelf(r.Context(), reasonSelfLogout); err != nil {
+		s.logger.Printf("logout revoke failed: %v", err)
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "logout failed"))
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   -1,
-		Expires:  s.now().AddDate(0, 0, -1),
-		SameSite: sameSite(s.cfg.CookieSameSite),
-		Secure:   s.cfg.CookieSecure,
-	})
+	s.clearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
 }

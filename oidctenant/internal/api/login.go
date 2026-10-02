@@ -211,8 +211,14 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "session token failed"))
 		return
 	}
-	if _, err := s.store.CreateSession(r.Context(), ar.TenantID, result.Member.ID,
-		sec.HashToken(token), s.cfg.SessionTTL); err != nil {
+	if _, err := s.store.CreateSession(r.Context(), store.CreateSessionParams{
+		TenantID:    ar.TenantID,
+		MemberID:    result.Member.ID,
+		TokenHash:   sec.HashToken(token),
+		TTL:         s.cfg.SessionTTL,
+		DeviceLabel: deviceLabelFromRequest(r),
+		LastIP:      clientIP(r),
+	}); err != nil {
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "create session failed"))
 		return
 	}

@@ -43,7 +43,6 @@ func main() {
 
 	stop := make(chan struct{})
 	go cleanupLoop(context.Background(), st, cfg.CleanupInterval, cfg.AuthRequestTTL, logger, stop)
-
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           srv.Routes(),
@@ -70,7 +69,7 @@ func main() {
 	}
 }
 
-// cleanupLoop 周期性删除过期的 auth_request 行，防止 state 表无限增长。
+// cleanupLoop 周期性删除过期的 auth_request 与 sessions 行，防止表无限增长。
 func cleanupLoop(ctx context.Context, st *store.Store, interval, ttl time.Duration,
 	logger *log.Logger, stop chan struct{}) {
 	ticker := time.NewTicker(interval)
@@ -84,6 +83,9 @@ func cleanupLoop(ctx context.Context, st *store.Store, interval, ttl time.Durati
 		case <-ticker.C:
 			if err := st.DeleteExpiredAuthRequests(ctx, time.Now().Add(-ttl)); err != nil {
 				logger.Printf("cleanup auth_requests: %v", err)
+			}
+			if err := st.DeleteExpiredSessions(ctx, time.Now()); err != nil {
+				logger.Printf("cleanup sessions: %v", err)
 			}
 		}
 	}

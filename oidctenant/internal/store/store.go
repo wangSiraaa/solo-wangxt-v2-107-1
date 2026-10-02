@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,8 @@ var (
 	ErrConsumed = errors.New("store: auth request already consumed or unknown")
 	// ErrConflict 表示唯一约束冲突（绑定冲突）。
 	ErrConflict = errors.New("store: unique constraint violation")
+	// ErrLockBusy 表示等待会话行锁超时（撤销与受保护请求竞争），调用方可安全重试。
+	ErrLockBusy = errors.New("store: session lock busy")
 )
 
 type Store struct {
@@ -39,8 +42,15 @@ func mapErr(err error) error {
 		return ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return ErrConflict
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505": // unique_violation
+			return ErrConflict
+		case "55P03": // lock_not_available（SET LOCAL lock_timeout 超时）
+			return ErrLockBusy
+		case "40P01": // deadlock_detected（多个批量撤销竞争，任一方安全重试即可）
+			return ErrLockBusy
+		}
 	}
 	return err
 }
@@ -315,38 +325,289 @@ func (s *Store) IdentityByAnchor(ctx context.Context, tenantID uuid.UUID, issuer
 	return &i, nil
 }
 
-// ---------- sessions ----------
+// ---------- sessions（设备会话） ----------
+//
+// 并发与撤销竞争的核心约定：
+//
+//   - 受保护请求在 AcquireSessionLease 中以 SELECT ... FOR UPDATE 锁住会话行，
+//     并在整个请求期间（SessionLease.Finalize/Rollback 之前）持续持有该锁；
+//     Finalize 在同事务刷新 last_seen_at，使“观察到活跃状态”与“刷新活动时间”原子化。
+//   - 撤销（RevokeMemberSession 针对其他设备；RevokeSelf/RevokeOthers 针对当前请求
+//     自己的设备或同成员其余设备）都对目标行 FOR UPDATE 后才写 revoked_at。
+//     锁与写在同一个事务，因此：
+//     要么撤销先拿到锁（请求随后拿锁即看到 revoked_at，401，绝不放行写入）；
+//     要么请求先拿到锁（撤销必须等到请求结束，不存在“撤销后该请求仍成功写入”）。
+//   - 批量撤销按会话 id 排序后逐行加锁，多个并发撤销之间形成全局一致的
+//     加锁顺序，避免 AB-BA 死锁。
 
-func (s *Store) CreateSession(ctx context.Context, tenantID, memberID uuid.UUID, tokenHash []byte, ttl time.Duration) (*models.Session, error) {
-	id := uuid.New()
-	now := time.Now()
-	exp := now.Add(ttl)
-	if _, err := s.pool.Exec(ctx,
-		`INSERT INTO sessions(id, tenant_id, member_id, token_hash, created_at, expires_at)
-		 VALUES ($1,$2,$3,$4,$5,$6)`,
-		id, tenantID, memberID, tokenHash, now, exp); err != nil {
-		return nil, err
-	}
-	return &models.Session{ID: id, TenantID: tenantID, MemberID: memberID,
-		TokenHash: tokenHash, ExpiresAt: exp}, nil
+// CreateSessionParams 携带创建设备会话所需的全部非令牌信息。
+type CreateSessionParams struct {
+	TenantID    uuid.UUID
+	MemberID    uuid.UUID
+	TokenHash   []byte
+	TTL         time.Duration
+	DeviceLabel string
+	LastIP      string
 }
 
-func (s *Store) SessionByHash(ctx context.Context, tokenHash []byte) (*models.Session, error) {
+func (s *Store) CreateSession(ctx context.Context, p CreateSessionParams) (*models.Session, error) {
+	id := uuid.New()
+	now := time.Now()
+	exp := now.Add(p.TTL)
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO sessions
+		 (id, tenant_id, member_id, token_hash, device_label, last_ip,
+		  created_at, last_seen_at, expires_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8)`,
+		id, p.TenantID, p.MemberID, p.TokenHash, p.DeviceLabel, p.LastIP, now, exp); err != nil {
+		return nil, err
+	}
+	return &models.Session{
+		ID: id, TenantID: p.TenantID, MemberID: p.MemberID, TokenHash: p.TokenHash,
+		DeviceLabel: p.DeviceLabel, LastIP: p.LastIP,
+		CreatedAt: now, LastSeenAt: now, ExpiresAt: exp,
+	}, nil
+}
+
+// sessionLockTimeout 是等待单条会话行锁的上限。
+// 行锁只在单个 HTTP 请求期间持有，等待超过该值视为繁忙竞争（可安全重试）。
+const sessionLockTimeout = 10 * time.Second
+
+// SessionLease 是受保护请求期间对某条会话行持有的 FOR UPDATE 锁。
+// 请求结束必须调用 Finalize（放行并刷新活动时间/提交自撤销）或 Rollback（错误路径）。
+type SessionLease struct {
+	tx      pgx.Tx
+	Sess    *models.Session
+	revoked bool // 当前请求在租约事务内撤销了自身（logout / 撤销当前设备 / 全部退出）
+}
+
+const sessionColumns = `id, tenant_id, member_id, token_hash, device_label,
+	created_at, last_seen_at, last_ip, expires_at, revoked_at, revoked_reason`
+
+func scanSession(row pgx.Row) (*models.Session, error) {
 	var sess models.Session
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, tenant_id, member_id, token_hash, expires_at FROM sessions
-		 WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()`,
-		tokenHash,
-	).Scan(&sess.ID, &sess.TenantID, &sess.MemberID, &sess.TokenHash, &sess.ExpiresAt)
+	var revokedAt sql.NullTime
+	var revokedReason sql.NullString
+	err := row.Scan(&sess.ID, &sess.TenantID, &sess.MemberID, &sess.TokenHash,
+		&sess.DeviceLabel, &sess.CreatedAt, &sess.LastSeenAt, &sess.LastIP,
+		&sess.ExpiresAt, &revokedAt, &revokedReason)
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	sess.RevokedAt = revokedAt
+	sess.RevokedReason = revokedReason
 	return &sess, nil
 }
 
-func (s *Store) RevokeSession(ctx context.Context, id uuid.UUID) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL`, id)
+// AcquireSessionLease 按 sid 哈希取出会话、锁住行并在同一事务中校验状态。
+//
+// 返回的 SessionLease.Sess 保证在租约期间不会被撤销（撤销方阻塞在同一行锁上）。
+// 未找到/已撤销/已过期统一返回 ErrNotFound —— 对调用方而言都是“认证失败”，
+// 不区分会话是否存在，避免据此枚举有效 sid。
+func (s *Store) AcquireSessionLease(ctx context.Context, tokenHash []byte) (*SessionLease, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('lock_timeout', $1, true)",
+		fmt.Sprintf("%dms", sessionLockTimeout.Milliseconds())); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	sess, err := scanSession(tx.QueryRow(ctx,
+		`SELECT `+sessionColumns+`
+		 FROM sessions WHERE token_hash = $1 FOR UPDATE`,
+		tokenHash))
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if sess.RevokedAt.Valid || !sess.ExpiresAt.After(time.Now()) {
+		_ = tx.Rollback(ctx)
+		return nil, ErrNotFound
+	}
+	return &SessionLease{tx: tx, Sess: sess}, nil
+}
+
+// RevokeSelf 在租约事务内撤销“当前会话自身”。
+//
+// 必须走租约事务而非新开事务：当前行已被本租约 FOR UPDATE 锁定，
+// 另开事务会自锁到 lock_timeout。撤销随 Finalize 一起原子提交，
+// 因此“本请求处理完成”与“当前会话已撤销”是同一个提交点。
+func (l *SessionLease) RevokeSelf(ctx context.Context, reason string) error {
+	if _, err := l.tx.Exec(ctx,
+		`UPDATE sessions SET revoked_at = now(), revoked_reason = $2 WHERE id = $1`,
+		l.Sess.ID, reason); err != nil {
+		return mapErr(err)
+	}
+	l.revoked = true
+	l.Sess.RevokedAt = sql.NullTime{Time: time.Now(), Valid: true}
+	l.Sess.RevokedReason = sql.NullString{String: reason, Valid: true}
+	return nil
+}
+
+// RevokeOthers 在租约事务内撤销同一成员同一租户下“除当前会话外”的全部活跃会话。
+//
+// 复用当前请求的事务（当前会话行已锁），其余目标行按 id 排序后逐行 FOR UPDATE
+// 再更新：排序让并发的批量撤销/单个撤销之间形成一致加锁顺序，配合 lock_timeout
+// 与死锁检测，竞争时返回 ErrLockBusy 由上层转 503，客户端可安全重试。
+// 返回本次新撤销的会话数。
+func (l *SessionLease) RevokeOthers(ctx context.Context, reason string) (int, error) {
+	n, err := revokeActiveSessionsTx(ctx, l.tx,
+		l.Sess.TenantID, l.Sess.MemberID, &l.Sess.ID, reason)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// Revoked 报告本请求是否已在租约内撤销自身。
+func (l *SessionLease) Revoked() bool { return l.revoked }
+
+// Finalize 结束请求：正常路径刷新最近活动并提交；
+// 若请求内已撤销自身，则直接提交（不再刷新活动，避免撤销行看起来仍活跃）。
+func (l *SessionLease) Finalize(ctx context.Context, lastIP string) error {
+	if l.revoked {
+		return l.tx.Commit(ctx)
+	}
+	if _, err := l.tx.Exec(ctx,
+		`UPDATE sessions SET last_seen_at = now(), last_ip = $2 WHERE id = $1`,
+		l.Sess.ID, lastIP); err != nil {
+		_ = l.tx.Rollback(ctx)
+		return err
+	}
+	return l.tx.Commit(ctx)
+}
+
+// Rollback 放弃租约（错误/未授权路径），释放行锁。
+func (l *SessionLease) Rollback(ctx context.Context) { _ = l.tx.Rollback(ctx) }
+
+// RevokeResult 描述一次撤销的结果（供接口幂等地构造响应）。
+type RevokeResult struct {
+	// Revoked 为 true 表示本次调用实际写入了 revoked_at；
+	// false 表示会话此前已撤销（幂等重放）。
+	Revoked bool
+	// Exists 为 false 表示当前租户/成员下没有这条会话。
+	// 跨租户、跨成员与不存在返回完全一致的结果，杜绝枚举。
+	Exists bool
+	Reason string
+}
+
+// RevokeMemberSession 撤销指定成员在指定租户下的某台设备会话。
+//
+// 在独立事务里按 id 锁住行：与受保护请求的租约锁互斥，从而把
+// “撤销某会话”与“该会话上的受保护操作”线性化，二者不会交叉成功。
+func (s *Store) RevokeMemberSession(ctx context.Context,
+	tenantID, memberID, sessionID uuid.UUID, reason string) (RevokeResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return RevokeResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('lock_timeout', $1, true)",
+		fmt.Sprintf("%dms", sessionLockTimeout.Milliseconds())); err != nil {
+		return RevokeResult{}, err
+	}
+	sess, err := scanSession(tx.QueryRow(ctx,
+		`SELECT `+sessionColumns+` FROM sessions WHERE id = $1 FOR UPDATE`, sessionID))
+	if errors.Is(err, ErrNotFound) {
+		// 未知 id / 跨租户 / 跨成员：不区分，统一“不存在”。
+		return RevokeResult{Exists: false}, tx.Commit(ctx)
+	}
+	if err != nil {
+		return RevokeResult{}, err
+	}
+	if sess.TenantID != tenantID || sess.MemberID != memberID {
+		return RevokeResult{Exists: false}, nil
+	}
+	res := RevokeResult{Exists: true, Reason: reason}
+	if sess.RevokedAt.Valid {
+		// 已撤销：稳定幂等，回传既有撤销原因。
+		res.Revoked = false
+		if sess.RevokedReason.Valid {
+			res.Reason = sess.RevokedReason.String
+		}
+		return res, tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE sessions SET revoked_at = now(), revoked_reason = $2 WHERE id = $1`,
+		sessionID, reason); err != nil {
+		return RevokeResult{}, err
+	}
+	res.Revoked = true
+	return res, tx.Commit(ctx)
+}
+
+// revokeActiveSessionsTx 在给定事务内按 id 排序锁定并撤销全部活跃会话，
+// except 非空时跳过该会话。加锁顺序固定（id ASC）以避免并发批量撤销死锁。
+// 返回新撤销的行数。
+func revokeActiveSessionsTx(ctx context.Context, tx pgx.Tx,
+	tenantID, memberID uuid.UUID, except *uuid.UUID, reason string) (int, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT id FROM sessions
+		 WHERE tenant_id = $1 AND member_id = $2 AND revoked_at IS NULL AND expires_at > now()
+		 ORDER BY id FOR UPDATE`,
+		tenantID, memberID)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if except != nil && id == *except {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	rows.Close()
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx,
+			`UPDATE sessions SET revoked_at = now(), revoked_reason = $2 WHERE id = $1`,
+			id, reason); err != nil {
+			return 0, mapErr(err)
+		}
+	}
+	return len(ids), nil
+}
+
+// MemberSessions 返回成员在当前租户下未过期的全部会话（含已撤销的），
+// 最近活跃在前。不返回 token_hash —— 列表永远不暴露可用于登录的材料。
+func (s *Store) MemberSessions(ctx context.Context,
+	tenantID, memberID uuid.UUID) ([]models.Session, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+sessionColumns+`
+		 FROM sessions
+		 WHERE tenant_id = $1 AND member_id = $2 AND expires_at > now()
+		 ORDER BY last_seen_at DESC, created_at DESC`,
+		tenantID, memberID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.Session
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *sess)
+	}
+	return out, rows.Err()
+}
+
+// DeleteExpiredSessions 物理删除过期会话行（定时清理由 cmd/server 调用）。
+func (s *Store) DeleteExpiredSessions(ctx context.Context, before time.Time) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE expires_at < $1`, before)
 	return err
 }
 
