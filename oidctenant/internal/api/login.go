@@ -211,8 +211,10 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "session token failed"))
 		return
 	}
+	// 设备标签只派生自 User-Agent 摘要，绝不包含令牌/授权码内容。
+	label := sec.DeviceLabel(r.Header.Get("User-Agent"))
 	if _, err := s.store.CreateSession(r.Context(), ar.TenantID, result.Member.ID,
-		sec.HashToken(token), s.cfg.SessionTTL); err != nil {
+		sec.HashToken(token), label, s.cfg.SessionTTL); err != nil {
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "create session failed"))
 		return
 	}
@@ -237,6 +239,25 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 		MaxAge:   int(s.cfg.SessionTTL.Seconds()),
 	}
 	http.SetCookie(w, &sec)
+}
+
+// clearSessionCookie 让浏览器删除 sid。
+//   - revokedByServer=true：会话是被“退出/撤销”动作主动终结的（logout、撤销当前
+//     设备、全部退出），随 200/302 等成功响应一起清理；
+//   - false：中间件发现 Cookie 指向的会话已无效（在其他设备上被撤销/过期），
+//     随 401 一起清理，使“当前会话被撤销”在浏览器侧得到一致结果。
+//
+// 两种路径都不回显旧值，Cookie 头本身也不会泄漏 sid。
+func (s *Server) clearSessionCookie(w http.ResponseWriter, _ *http.Request, _ bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+		Expires:  s.now().AddDate(0, 0, -1),
+		SameSite: sameSite(s.cfg.CookieSameSite),
+		Secure:   s.cfg.CookieSecure,
+	})
 }
 
 func (s *Server) logVerifyFailure(err error) {

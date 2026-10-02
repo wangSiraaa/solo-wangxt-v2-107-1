@@ -1,10 +1,7 @@
 package api
 
 import (
-	"errors"
 	"net/http"
-
-	"github.com/example/oidctenant/internal/store"
 )
 
 // identityView 暴露给业务接口的身份信息。
@@ -37,25 +34,23 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		"tenant_id":  ac.session.TenantID.String(),
 		"name":       ac.member.DisplayName,
 		"identities": out,
+		// 当前设备会话 id（非 sid 本身），前端可用它高亮“当前设备”。
+		"session_id": ac.session.ID.String(),
 	})
 }
 
 // POST /t/{slug}/api/logout
+//
+// 保持既有“单设备退出”语义：只撤销当前浏览器的会话并清理 sid Cookie，
+// 其他设备不受影响。撤销发生在鉴权请求事务内（持当前会话行锁），
+// 与并发请求严格串行。
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	ac := authed(r)
-	if err := s.store.RevokeSession(r.Context(), ac.session.ID); err != nil &&
-		!errors.Is(err, store.ErrNotFound) {
+	if err := s.store.RevokeCurrentSession(r.Context(), ac.session.ID); err != nil {
+		s.logger.Printf("logout: %v", err)
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "logout failed"))
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   -1,
-		Expires:  s.now().AddDate(0, 0, -1),
-		SameSite: sameSite(s.cfg.CookieSameSite),
-		Secure:   s.cfg.CookieSecure,
-	})
+	s.clearSessionCookie(w, r, true)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
 }

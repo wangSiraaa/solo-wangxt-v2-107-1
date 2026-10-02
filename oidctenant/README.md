@@ -36,7 +36,7 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `members` | 租户内的成员（业务账号） |
 | `identities` | 已核实身份；**`UNIQUE(tenant_id, issuer, subject)` 是身份锚点**；`email` 无唯一约束 |
 | `auth_requests` | 进行中的授权请求：`state` 主键 + `nonce` + `pkce_verifier`，一次性消费（`consumed_at`） |
-| `sessions` | 不透明会话令牌（数据库存 SHA-256 哈希） |
+| `sessions` | 不透明会话令牌（数据库存 SHA-256 哈希）+ **设备展示标签 / 创建 / 最近活动 / 撤销状态** |
 | `link_sessions` | 账号关联会话：A/B 两条 leg 的 issuer/subject/auth_time，一次性 token |
 
 > 关联外部身份时，身份行的 `tenant_id` 是**发起关联的租户**。
@@ -58,6 +58,7 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `binding_conflict` | 409 | 目标身份已绑给别的成员、自关联、关联会话重放 |
 | `invalid_request` | 400 | state 缺失/已用/伪造、回调地址不在白名单、参数非法 |
 | `reauthentication_required` | 401 | 关联时某一身份未在 `auth_time_max_age` 窗口内重新认证 |
+| `not_found` | 404 | 撤销不存在/不属于自己（含跨租户、跨成员）的设备会话，无法枚举 |
 
 端点：
 
@@ -67,10 +68,45 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `GET  /t/{slug}/login?issuer=...&return_to=/...` | 发起登录，302 到 IdP |
 | `GET  /oauth/callback` | 登录回调（固定路径） |
 | `GET  /t/{slug}/api/me` | 当前成员与其已绑定身份（需会话 Cookie `sid`） |
-| `POST /t/{slug}/api/logout` | 吊销会话 |
+| `POST /t/{slug}/api/logout` | **单设备退出**：只吊销当前浏览器会话并清理 `sid`，其他设备不受影响 |
+| `GET  /t/{slug}/api/sessions` | 列出当前成员在本租户的**设备会话**（标签、创建/最近活动时间、活跃/已撤销状态） |
+| `DELETE /t/{slug}/api/sessions/{id}` | **撤销指定设备**；撤当前设备等价 logout；重复撤销幂等返回 `already_revoked` |
+| `POST /t/{slug}/api/sessions/revoke-all` | **全部设备退出**：撤销其他全部设备 + 当前设备，清理 `sid` |
 | `POST /t/{slug}/api/links` | 发起账号关联，返回 `link_token` 与 `link_url`；body `{"issuer":"..."}` |
 | `GET  /oauth/link/callback` | 关联第二身份的回调（强制重认证） |
 | `GET  /t/{slug}/api/links/{token}` | 查询关联会话状态（一次性） |
+
+## 设备会话管理（丢失设备只撤那一台）
+
+会话仍是不透明 `sid`（库内仅存 SHA-256）。在此之上每个会话额外保存：
+
+- `display_label`：**只由 `User-Agent` 脱敏摘要得到**（折叠空白/控制字符、限长），
+  绝不包含 sid、授权码、ID/access token；空 UA 记为 `Unknown device`；
+- `created_at` / `last_activity_at`：创建与最近活动时间（鉴权命中时刷新）；
+- 活跃/已撤销：由 `revoked_at IS NULL AND expires_at > now()` 派生；
+  `revoked_at` 是永久、幂等的状态位。
+
+对外列表/响应只暴露会话行的内部 UUID（不是 sid 本身）、标签与时间，
+任何响应、日志、列表都不回显原始 sid、授权码或身份令牌。
+
+**并发与撤销竞争的正确性**（中间件强保证）：
+
+1. 每个受保护请求在一个**请求级事务**里执行；中间件用条件
+   `UPDATE sessions SET last_activity_at=now() WHERE token_hash=$1
+   AND revoked_at IS NULL AND expires_at>now() RETURNING ...`
+   同时完成“取行 + 对该行加排他行锁 + 拒绝已撤销/已过期 + 刷新活动时间”。
+2. 行锁持有到整个 handler 结束（事务提交）。撤销另一设备的语句在**独立事务**里
+   对同一行 `FOR UPDATE`，因此与该设备正在进行的受保护操作严格串行：
+   要么撤销先提交（随后该 sid 的鉴权立刻失败），要么受保护请求先提交
+   （其任何写入/活动时间都不晚于 `revoked_at`）。**不存在“撤销之后还成功写入”**。
+3. 响应写入前有“提交闸门”（`commitWriter`）：只有请求事务提交成功，
+   handler 选定的 2xx 才会发给客户端，杜绝“客户端收到成功、事务却回滚”。
+4. 撤销他人/全部设备在独立事务内**按 id 有序加锁**（`ORDER BY id FOR UPDATE`），
+   消除并发互撤的死锁；遇 Postgres 死锁牺牲者做有限退避重试（撤销幂等，重试安全）。
+5. 当前会话被撤销（在别的设备上被踢）后，下次访问受保护接口返回
+   401 `authentication_failed` 并**下发删除 `sid` 的 Cookie**，浏览器侧结果一致。
+6. 撤销的归属条件 `(tenant_id, member_id)` 直接写进 SQL：跨租户（即使邮箱相同）
+   或同租户其他成员的会话 id 一律影响 0 行 → 404 `not_found`，无法枚举或撤销。
 
 ## 安全实现细节
 
@@ -172,6 +208,13 @@ KC_BASE_URL=http://localhost:8180 go test ./integration/... -v
 | `TestRedirectURIMustBeWhitelisted` | 未登记回调地址 → 400 `invalid_request` |
 | `TestLinkRejectsDisabledProvider` | 关联前禁用 provider 授权 → 403 `tenant_unauthorized` |
 | `TestWrongPasswordIsAuthnFailure` | IdP 凭证错误不产生会话/成员 |
+| `TestDeviceSessionsTwoDevicesAreDistinctAndSelectiveRevoke` | **两设备可区分、只撤一台**；被撤设备 me/关联接口 401 并清 Cookie，另一台仍可用 |
+| `TestRevokeSessionIsIdempotent` | **重复撤销**稳定返回 revoked → already_revoked |
+| `TestRevokeRacesWithInFlightProtectedOperation` | **撤销与受保护操作竞争**：在途请求提交后撤销才完成，其后无成功写入 |
+| `TestRevokeCrossTenantAndCrossMemberIsDenied` | **跨租户同邮箱/另一成员**会话不能枚举或撤销（统一 404） |
+| `TestLogoutKeepsSingleDeviceSemantics` | 原有**单设备 logout** 语义不变（不撤其他设备） |
+| `TestRevokeAllDevicesLogsOutEverySession` | **全部设备退出**：三台全撤、当前 Cookie 清理 |
+| `TestSessionLabelNeverContainsTokenMaterial` | 设备标签脱敏、控制字符注入失效、列表不泄漏 sid |
 
 ## 生产化前还应补充（本项目刻意省略）
 

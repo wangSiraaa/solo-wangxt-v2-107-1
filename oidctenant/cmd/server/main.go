@@ -43,7 +43,6 @@ func main() {
 
 	stop := make(chan struct{})
 	go cleanupLoop(context.Background(), st, cfg.CleanupInterval, cfg.AuthRequestTTL, logger, stop)
-
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           srv.Routes(),
@@ -84,6 +83,11 @@ func cleanupLoop(ctx context.Context, st *store.Store, interval, ttl time.Durati
 		case <-ticker.C:
 			if err := st.DeleteExpiredAuthRequests(ctx, time.Now().Add(-ttl)); err != nil {
 				logger.Printf("cleanup auth_requests: %v", err)
+			}
+			// 过期会话无法再通过鉴权（revoked/expires 双重条件），
+			// 物理删除以控制设备会话表增长；撤销记录的有效性不依赖保留过期行。
+			if err := st.DeleteExpiredSessions(ctx, time.Now()); err != nil {
+				logger.Printf("cleanup sessions: %v", err)
 			}
 		}
 	}

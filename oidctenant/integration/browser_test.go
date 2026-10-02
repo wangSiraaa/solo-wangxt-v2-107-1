@@ -21,6 +21,8 @@ type browserClient struct {
 	t   *testing.T
 	kc  *keycloakHTTP
 	app *http.Client
+	// ua 是发给应用的 User-Agent，用于区分设备标签。
+	ua string
 }
 
 func newBrowserClient(t *testing.T) *browserClient {
@@ -35,6 +37,12 @@ func newBrowserClient(t *testing.T) *browserClient {
 		},
 		app: &http.Client{Jar: appJar, Timeout: 20 * time.Second, CheckRedirect: noFollow},
 	}
+}
+
+// withUA 设置该“设备”的 User-Agent（设备标签来源）。
+func (b *browserClient) withUA(ua string) *browserClient {
+	b.ua = ua
+	return b
 }
 
 // appCallback 是 /oauth/callback 或 /oauth/link/callback 的落点结果。
@@ -119,10 +127,7 @@ func (b *browserClient) runAuthorizationFlow(appStartOrKCURL string, user keyclo
 
 // appStartRedirectsToKeycloak 请求应用启动端点，返回 Keycloak 授权地址。
 func (b *browserClient) appStartRedirectsToKeycloak(startURL string) string {
-	resp, err := b.app.Get(startURL)
-	if err != nil {
-		b.t.Fatalf("GET app start: %v", err)
-	}
+	resp := b.appDo(http.MethodGet, startURL, nil, nil)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
 		b.t.Fatalf("app start status=%d, want 302", resp.StatusCode)
@@ -134,23 +139,80 @@ func (b *browserClient) appStartRedirectsToKeycloak(startURL string) string {
 	return loc
 }
 
+// appDo 发起携带设备 User-Agent 的应用请求（不跟随重定向）。
+func (b *browserClient) appDo(method, raw string, body io.Reader, hdr map[string]string) *http.Response {
+	b.t.Helper()
+	req, err := http.NewRequest(method, raw, body)
+	if err != nil {
+		b.t.Fatalf("new request %s %s: %v", method, raw, err)
+	}
+	if b.ua != "" {
+		req.Header.Set("User-Agent", b.ua)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := b.app.Do(req)
+	if err != nil {
+		b.t.Fatalf("%s %s: %v", method, raw, err)
+	}
+	return resp
+}
+
 // callAppCallback 用应用 cookie jar 请求回调地址（授权码在此被服务端消费）。
 func (b *browserClient) callAppCallback(raw string) appCallback {
-	resp, err := b.app.Get(raw)
-	if err != nil {
-		b.t.Fatalf("GET app callback: %v", err)
-	}
+	resp := b.appDo(http.MethodGet, raw, nil, nil)
 	// 不关闭：调用方读取 Body；测试结束进程销毁连接无妨。
 	return appCallback{RequestURL: raw, Response: resp}
 }
 
 // replayCallback 用同样的应用 jar 再次请求同一回调 URL（授权码/state 重放）。
 func (b *browserClient) replayCallback(raw string) *http.Response {
-	resp, err := b.app.Get(raw)
-	if err != nil {
-		b.t.Fatalf("replay callback: %v", err)
+	return b.appDo(http.MethodGet, raw, nil, nil)
+}
+
+// ---------- 设备会话管理辅助 ----------
+
+// sessions 列出当前成员在该租户的设备会话。
+func (b *browserClient) sessions(tenantSlug string, wantStatus int) map[string]any {
+	b.t.Helper()
+	resp := b.appDo(http.MethodGet, appBaseURL+"/t/"+tenantSlug+"/api/sessions", nil, nil)
+	return decodeExpect(b.t, resp, wantStatus)
+}
+
+// revokeDevice 撤销指定设备会话，返回 (状态码, 响应体)。
+func (b *browserClient) revokeDevice(tenantSlug, sessionID string) (int, map[string]any) {
+	b.t.Helper()
+	resp := b.appDo(http.MethodDelete,
+		appBaseURL+"/t/"+tenantSlug+"/api/sessions/"+sessionID, nil, nil)
+	data := readBody(b.t, resp)
+	return resp.StatusCode, data
+}
+
+// revokeAllDevices 执行“退出全部设备”。
+func (b *browserClient) revokeAllDevices(tenantSlug string, wantStatus int) map[string]any {
+	b.t.Helper()
+	resp := b.appDo(http.MethodPost,
+		appBaseURL+"/t/"+tenantSlug+"/api/sessions/revoke-all",
+		strings.NewReader(""), map[string]string{"Content-Type": "application/json"})
+	return decodeExpect(b.t, resp, wantStatus)
+}
+
+// meResp 与 me 相同但返回原始响应（供 401/Cookie 断言）。
+func (b *browserClient) meResp(tenantSlug string) *http.Response {
+	b.t.Helper()
+	return b.appDo(http.MethodGet, appBaseURL+"/t/"+tenantSlug+"/api/me", nil, nil)
+}
+
+// sidCookie 返回浏览器当前持有的 sid Cookie（无则 nil）。
+func (b *browserClient) sidCookie() *http.Cookie {
+	u, _ := url.Parse(appBaseURL)
+	for _, c := range b.app.Jar.Cookies(u) {
+		if c.Name == "sid" {
+			return c
+		}
 	}
-	return resp
+	return nil
 }
 
 // postLink 直接 POST /api/links 并返回原始响应（供负面用例自定义期望状态）。

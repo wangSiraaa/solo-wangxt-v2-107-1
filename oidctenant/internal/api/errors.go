@@ -20,6 +20,8 @@ const (
 	ErrInvalidRequest ErrorType = "invalid_request"
 	// ErrReauthRequired 关联账号时身份未在规定时间内重新认证。
 	ErrReauthRequired ErrorType = "reauthentication_required"
+	// ErrNotFound 目标资源不存在或不属于调用者（设备会话枚举防护：统一为 404）。
+	ErrNotFound ErrorType = "not_found"
 )
 
 // APIError 携带 HTTP 状态、稳定错误码与可展示的简短描述。
@@ -54,6 +56,10 @@ func badRequest(msg string) *APIError {
 
 func reauthRequired(msg string) *APIError {
 	return newAPIError(http.StatusUnauthorized, ErrReauthRequired, msg)
+}
+
+func notFound(msg string) *APIError {
+	return newAPIError(http.StatusNotFound, ErrNotFound, msg)
 }
 
 func asAPIError(err error) (*APIError, bool) {

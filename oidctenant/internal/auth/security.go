@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"strings"
+	"unicode"
 )
 
 // RandomToken 返回 nBytes 字节熵的 URL 安全随机字符串。
@@ -53,4 +55,43 @@ func RedirectURIAllowed(allowed []string, candidate string) bool {
 		}
 	}
 	return false
+}
+
+// maxDeviceLabelRunes 限制设备标签长度；标签只是展示摘要，不需要任意长输入。
+const maxDeviceLabelRunes = 120
+
+// DeviceLabel 从 User-Agent 生成“不含令牌内容”的设备展示标签。
+//
+// 处理原则：
+//   - 只做脱敏/截断（去掉控制字符、折叠空白），不做 HTML 转义（输出是 JSON）；
+//   - 不接受调用方传入任意标签，标签永远派生自请求头这一受限来源；
+//   - sid / 授权码 / ID token 从不进入该函数，因此标签不可能携带凭据；
+//   - 空 UA 给稳定的占位名，避免列表出现空白设备。
+func DeviceLabel(userAgent string) string {
+	var b strings.Builder
+	lastSpace := false
+	for _, r := range userAgent {
+		switch {
+		case unicode.IsControl(r):
+			// 控制字符（含 \r\n）折叠为空格，杜绝日志/列表注入与换行伪造。
+			r = ' '
+			fallthrough
+		case unicode.IsSpace(r):
+			if !lastSpace && b.Len() > 0 {
+				b.WriteRune(' ')
+				lastSpace = true
+			}
+		default:
+			b.WriteRune(r)
+			lastSpace = false
+		}
+	}
+	label := strings.TrimSpace(b.String())
+	if label == "" {
+		return "Unknown device"
+	}
+	if runes := []rune(label); len(runes) > maxDeviceLabelRunes {
+		label = strings.TrimSpace(string(runes[:maxDeviceLabelRunes]))
+	}
+	return label
 }

@@ -69,7 +69,14 @@ type Session struct {
 	TenantID  uuid.UUID
 	MemberID  uuid.UUID
 	TokenHash []byte
-	ExpiresAt time.Time
+	// DisplayLabel 是仅供设备列表展示的标签（来自 User-Agent 的脱敏摘要），
+	// 绝不包含 sid、授权码、ID/access token 等任何凭据内容。
+	DisplayLabel   string
+	CreatedAt      time.Time
+	LastActivityAt time.Time
+	ExpiresAt      time.Time
+	// RevokedAt 非空表示该设备会话已被撤销（永久、幂等状态）。
+	RevokedAt NullTime
 }
 
 type LinkSession struct {
